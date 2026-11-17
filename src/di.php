@@ -198,6 +198,8 @@ $di['session'] = function () use ($di) {
     }
 
     $sessionLifetime = max(1, (int) Config::getProperty('security.session_lifespan', 7200));
+    $driver = $pdo->getAttribute(PDO::ATTR_DRIVER_NAME);
+    $lockMode = ($driver === 'sqlite') ? PdoSessionHandler::LOCK_NONE : PdoSessionHandler::LOCK_ADVISORY;
     $handler = new PdoSessionHandler($pdo, [
         'db_table' => 'session',
         'db_id_col' => 'id',
@@ -206,7 +208,8 @@ $di['session'] = function () use ($di) {
         'db_time_col' => 'modified_at',
         // The application uses the same connection for its business queries;
         // advisory locking avoids holding a transaction open for the request.
-        'lock_mode' => PdoSessionHandler::LOCK_ADVISORY,
+        // SQLite does not support advisory locks, so fallback to LOCK_NONE.
+        'lock_mode' => $lockMode,
     ]);
     $currentCookieParams = session_get_cookie_params();
     $cookieParams = [

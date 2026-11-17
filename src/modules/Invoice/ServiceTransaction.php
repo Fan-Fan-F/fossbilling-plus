@@ -822,7 +822,18 @@ class ServiceTransaction implements InjectionAwareInterface
 
         $ipn = $this->getIpnPayload($tx);
 
-        return $adapter->processTransaction($this->di['api_system'], (int) $id, $ipn, (int) $gtw->getId());
+        $result = $adapter->processTransaction($this->di['api_system'], (int) $id, $ipn, (int) $gtw->getId());
+
+        if (method_exists($adapter, 'getOutput')) {
+            $customOutput = $adapter->getOutput();
+            if ($customOutput !== null && $customOutput !== '') {
+                $tx->setOutput($customOutput);
+                $this->di['em']->persist($tx);
+                $this->di['em']->flush();
+            }
+        }
+
+        return $result;
     }
 
     /**

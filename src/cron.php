@@ -28,8 +28,9 @@ try {
     $service = $di['mod_service']('cron');
 
     if (Environment::isCLI()) {
+        ob_start();
         echo "\e[33m- Welcome to FOSSBilling.\n";
-        echo "\e[34mLast executed: {$service->getLastExecutionTime()}.\e[0m";
+        echo "\e[34mLast executed: {$service->getLastExecutionTime()}.\e[0m\n";
     }
 
     $success = $service->runCrons($interval);
@@ -38,8 +39,11 @@ try {
 } finally {
     if (Environment::isCLI()) {
         echo $success
-            ? "\e[32mSuccessfully ran the cron jobs.\e[0m"
+            ? "\e[32mSuccessfully ran the cron jobs.\e[0m\n"
             : "\e[31mCron jobs finished with failures. Check the logs for details.\e[0m" . PHP_EOL;
+        if (ob_get_level() > 0) {
+            ob_end_flush();
+        }
     }
 }
 

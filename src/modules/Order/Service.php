@@ -105,6 +105,11 @@ class Service implements InjectionAwareInterface
 
     public const META_STOCK_RESERVED_QTY = 'stock_reserved_qty';
 
+    public const string META_SETUP_RETRY_COUNT = 'setup_retry_count';
+    public const string META_SETUP_LAST_ERROR = 'setup_last_error';
+    public const string META_SETUP_FAILED_AT = 'setup_failed_at';
+    public const string META_SETUP_LAST_RETRY_AT = 'setup_last_retry_at';
+
     private const array BUILT_IN_SERVICE_TYPES = [
         \Box\Mod\Product\Service::CUSTOM,
         \Box\Mod\Product\Service::LICENSE,
@@ -1290,15 +1295,26 @@ class Service implements InjectionAwareInterface
             $mod = $this->di['mod']('service' . $serviceType);
             $s = $mod->getService();
             if (method_exists($s, 'create') || method_exists($s, 'action_create')) {
-                $service = $this->_callOnService($order, Order::ACTION_CREATE);
-                if (!is_object($service)) {
-                    throw new \FOSSBilling\Core\Exception\BaseException('Error creating ' . $serviceType . ' service for order ' . $orderId);
-                }
+                try {
+                    $service = $this->_callOnService($order, Order::ACTION_CREATE);
+                    if (!is_object($service)) {
+                        throw new \FOSSBilling\Core\Exception\BaseException('Error creating ' . $serviceType . ' service for order ' . $orderId);
+                    }
 
-                $serviceId = method_exists($service, 'getId') ? $service->getId() : $service->id;
-                $order->setServiceId((int) $serviceId);
-                $order->setUpdatedAt(new \DateTime());
-                $this->persistOrder($order);
+                    $serviceId = method_exists($service, 'getId') ? $service->getId() : $service->id;
+                    $order->setServiceId((int) $serviceId);
+                    $order->setUpdatedAt(new \DateTime());
+                    $this->persistOrder($order);
+                } catch (\Throwable $e) {
+                    $order->setStatus(Order::STATUS_FAILED_SETUP);
+                    $this->persistOrder($order);
+
+                    $this->saveStatusChange($order, 'Service creation failed: ' . $e->getMessage());
+                    $this->setOrderMetaValue($order, self::META_SETUP_LAST_ERROR, 'Service creation failed: ' . $e->getMessage());
+                    $this->setOrderMetaValue($order, self::META_SETUP_FAILED_AT, date('Y-m-d H:i:s'));
+
+                    throw $e;
+                }
             }
         }
 
@@ -1329,6 +1345,7 @@ class Service implements InjectionAwareInterface
             $order->setUpdatedAt(new \DateTime());
 
             $this->persistOrder($order);
+            $this->setOrderMetaValue($order, self::META_SETUP_LAST_ERROR, null);
         } catch (\Throwable $e) {
             // Caught broadly (not just \Exception): an \Error or \TypeError
             // here means the service was already provisioned remotely, so
@@ -1338,6 +1355,8 @@ class Service implements InjectionAwareInterface
             $this->persistOrder($order);
 
             $this->saveStatusChange($order, $e->getMessage());
+            $this->setOrderMetaValue($order, self::META_SETUP_LAST_ERROR, 'Service activation failed: ' . $e->getMessage());
+            $this->setOrderMetaValue($order, self::META_SETUP_FAILED_AT, date('Y-m-d H:i:s'));
 
             throw $e;
         }
@@ -2249,6 +2268,138 @@ class Service implements InjectionAwareInterface
         $days = ($configValue === null || $configValue === '') ? $default : (int) $configValue;
 
         return $days < 0 ? $default : $days;
+    }
+
+    public function getOrderSetupRetryCount(Order $order): int
+    {
+        $meta = $this->getOrderMetaRepository()->findOneByOrderIdAndName($this->orderId($order), self::META_SETUP_RETRY_COUNT);
+
+        return $meta instanceof OrderMeta ? (int) $meta->getValue() : 0;
+    }
+
+    public function setOrderMetaValue(Order $order, string $name, ?string $value): void
+    {
+        $orderId = $this->orderId($order);
+        $meta = $this->getOrderMetaRepository()->findOneByOrderIdAndName($orderId, $name);
+        if ($value === null) {
+            if ($meta instanceof OrderMeta) {
+                $this->di['em']->remove($meta);
+                $this->di['em']->flush();
+            }
+
+            return;
+        }
+
+        if (!$meta instanceof OrderMeta) {
+            $meta = new OrderMeta();
+            $meta->setOrder($order);
+            $meta->setName($name);
+            $meta->setCreatedAt(new \DateTime());
+        }
+        $meta->setValue($value);
+        $meta->setUpdatedAt(new \DateTime());
+        $this->di['em']->persist($meta);
+        $this->di['em']->flush();
+    }
+
+    public function resetFailedOrderRetries(Order $order): bool
+    {
+        $this->setOrderMetaValue($order, self::META_SETUP_RETRY_COUNT, '0');
+        $this->setOrderMetaValue($order, self::META_SETUP_LAST_ERROR, null);
+        $this->setOrderMetaValue($order, self::META_SETUP_LAST_RETRY_AT, null);
+        $this->saveStatusChange($order, 'Order setup retry counters reset by admin');
+
+        return true;
+    }
+
+    public function retryFailedOrder(Order $order): bool
+    {
+        if ($order->getStatus() !== Order::STATUS_FAILED_SETUP) {
+            throw new InformationException('Only orders with status "failed_setup" can be recovered');
+        }
+
+        $orderId = $this->orderId($order);
+        $retries = $this->getOrderSetupRetryCount($order) + 1;
+        $this->setOrderMetaValue($order, self::META_SETUP_RETRY_COUNT, (string) $retries);
+        $this->setOrderMetaValue($order, self::META_SETUP_LAST_RETRY_AT, date('Y-m-d H:i:s'));
+
+        try {
+            $result = $this->activateOrder($order, ['force' => true]);
+            $this->setOrderMetaValue($order, self::META_SETUP_LAST_ERROR, null);
+            $this->saveStatusChange($order, sprintf('Order #%d recovered successfully on retry attempt #%d', $orderId, $retries));
+
+            return $result;
+        } catch (\Throwable $e) {
+            $this->setOrderMetaValue($order, self::META_SETUP_LAST_ERROR, $e->getMessage());
+            $this->saveStatusChange($order, sprintf('Order #%d retry attempt #%d failed: %s', $orderId, $retries, $e->getMessage()));
+
+            throw $e;
+        }
+    }
+
+    public function batchRetryFailedSetup(int $maxRetries = 3, int $retryDelayMinutes = 5, int $limit = 20): array
+    {
+        $connection = $this->di['em']->getConnection();
+        $table = $connection->quoteSingleIdentifier('client_order');
+
+        $rows = $connection->fetchAllAssociative(
+            "SELECT id FROM {$table} WHERE status = :status ORDER BY id ASC LIMIT " . max(1, $limit),
+            ['status' => Order::STATUS_FAILED_SETUP]
+        );
+
+        $stats = [
+            'total' => count($rows),
+            'attempted' => 0,
+            'recovered' => 0,
+            'failed' => 0,
+            'exhausted' => 0,
+            'cooling_down' => 0,
+        ];
+
+        $now = time();
+        $cooldownSeconds = $retryDelayMinutes * 60;
+
+        foreach ($rows as $row) {
+            $orderId = (int) $row['id'];
+            $order = $this->getOrderRepository()->find($orderId);
+            if (!$order instanceof Order || $order->getStatus() !== Order::STATUS_FAILED_SETUP) {
+                continue;
+            }
+
+            $currentRetries = $this->getOrderSetupRetryCount($order);
+            if ($currentRetries >= $maxRetries) {
+                ++$stats['exhausted'];
+
+                continue;
+            }
+
+            $lastRetryMeta = $this->getOrderMetaRepository()->findOneByOrderIdAndName($orderId, self::META_SETUP_LAST_RETRY_AT);
+            if ($lastRetryMeta instanceof OrderMeta && !empty($lastRetryMeta->getValue())) {
+                $lastRetryTime = strtotime($lastRetryMeta->getValue());
+                if ($lastRetryTime !== false && ($now - $lastRetryTime) < $cooldownSeconds) {
+                    ++$stats['cooling_down'];
+
+                    continue;
+                }
+            }
+
+            ++$stats['attempted'];
+
+            try {
+                $this->retryFailedOrder($order);
+                ++$stats['recovered'];
+            } catch (\Throwable $e) {
+                ++$stats['failed'];
+                $this->di['logger']->error('Order #{order_id} failed setup retry: {message}', [
+                    'order_id' => $orderId,
+                    'message' => $e->getMessage(),
+                ]);
+            }
+        }
+
+        $this->di['logger']->info('Batch retry for failed orders finished: {recovered} recovered, {failed} failed, {exhausted} exhausted, {cooling_down} cooling down.', $stats);
+
+        return $stats;
     }
 
     public function updateOrderConfig(Order $order, array $config): bool

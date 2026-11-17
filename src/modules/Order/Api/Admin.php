@@ -359,6 +359,54 @@ class Admin extends \FOSSBilling\Core\Api\AbstractApi
     }
 
     /**
+     * Batch retry provisioning for orders in failed_setup status.
+     *
+     * @optional int $max_retries - Maximum retry attempts per order (default 3)
+     * @optional int $retry_delay - Cooldown in minutes before next attempt (default 5)
+     * @optional int $limit - Maximum orders to attempt per batch (default 20)
+     *
+     * @return array Summary of recovery results
+     */
+    public function batch_retry_failed_setup(array $data = []): array
+    {
+        $this->checkPermissions('order', 'manage');
+
+        $maxRetries = isset($data['max_retries']) ? (int) $data['max_retries'] : 3;
+        $retryDelay = isset($data['retry_delay']) ? (int) $data['retry_delay'] : 5;
+        $limit = isset($data['limit']) ? (int) $data['limit'] : 20;
+
+        return $this->getService()->batchRetryFailedSetup($maxRetries, $retryDelay, $limit);
+    }
+
+    /**
+     * Retry provisioning for a specific failed order.
+     *
+     * @param array $data Contains order 'id'
+     */
+    public function retry_setup(array $data): bool
+    {
+        $this->checkPermissions('order', 'manage');
+
+        $order = $this->_getOrder($data);
+
+        return $this->getService()->retryFailedOrder($order);
+    }
+
+    /**
+     * Reset setup retry counters for a failed order.
+     *
+     * @param array $data Contains order 'id'
+     */
+    public function reset_setup_retries(array $data): bool
+    {
+        $this->checkPermissions('order', 'manage');
+
+        $order = $this->_getOrder($data);
+
+        return $this->getService()->resetFailedOrderRetries($order);
+    }
+
+    /**
      * Update order config.
      *
      * @return bool

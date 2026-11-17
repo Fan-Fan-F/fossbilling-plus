@@ -598,6 +598,10 @@ class Service implements InjectionAwareInterface
             $fromCurrencyCode = $defaultCurrency->getCode();
         }
 
+        if ($fromCurrencyCode === $toCurrencyCode) {
+            return 1.0;
+        }
+
         $config = $this->di['mod_config']('currency');
         $validFor = match ($config['sync_rate'] ?? 'auto') {
             '1h' => 3600,

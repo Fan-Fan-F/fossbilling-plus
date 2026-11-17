@@ -81,7 +81,17 @@ try {
     }
 
     $output = $service->createAndProcess($ipn);
-    $response = $apiResponseFactory->create($output);
+    $customOutput = null;
+    if ($output !== null) {
+        $tx = $service->getTransactionRepository()->find((int) $output);
+        $customOutput = $tx?->getOutput();
+    }
+
+    if ($customOutput !== null && $customOutput !== '') {
+        $response = new Response($customOutput, 200, ['Content-Type' => 'text/plain']);
+    } else {
+        $response = $apiResponseFactory->create($output);
+    }
 } catch (Exception $e) {
     $response = $apiResponseFactory->create(null, $e);
 }
